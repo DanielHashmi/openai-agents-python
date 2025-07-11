@@ -225,19 +225,17 @@ class Agent(Generic[TContext]):
             from .run import Runner, get_current_run_config
 
             # Get the current run_config from context if available
-            run_config = None
             current_run_config = get_current_run_config()
-            if current_run_config and current_run_config.pass_run_config_to_sub_agents:
-                run_config = current_run_config
 
             output = await Runner.run(
                 starting_agent=self,
                 input=input,
                 context=context.context,
-                run_config=run_config,
+                run_config=current_run_config,  # Pass inherited config
             )
             if custom_output_extractor:
                 return await custom_output_extractor(output)
+
             return ItemHelpers.text_message_outputs(output.new_items)
 
         return run_agent
@@ -262,9 +260,7 @@ class Agent(Generic[TContext]):
         """Get the prompt for the agent."""
         return await PromptUtil.to_model_input(self.prompt, run_context, self)
 
-    async def get_mcp_tools(
-        self, run_context: RunContextWrapper[TContext]
-    ) -> list[Tool]:
+    async def get_mcp_tools(self, run_context: RunContextWrapper[TContext]) -> list[Tool]:
         """Fetches the available tools from the MCP servers."""
         convert_schemas_to_strict = self.mcp_config.get("convert_schemas_to_strict", False)
         return await MCPUtil.get_all_function_tools(
