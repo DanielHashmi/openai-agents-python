@@ -4,22 +4,23 @@ search:
 ---
 # エージェント
 
-エージェントはアプリケーションの主要な構成要素です。エージェントとは、instructions と tools で構成された大規模言語モデル (LLM) です。
+エージェントはアプリの中核となるビルディングブロックです。エージェントとは、指示とツールで構成された大規模言語モデル ( LLM ) です。
 
 ## 基本設定
 
-エージェントでよく設定するプロパティは次のとおりです。
+エージェントで最もよく設定するプロパティは次のとおりです。
 
--   `name`: エージェントを識別する必須の文字列です。  
--   `instructions`: developer メッセージまたは system prompt とも呼ばれます。  
--   `model`: 使用する LLM を指定します。任意の `model_settings` で temperature、top_p などのモデル調整パラメーターを設定できます。  
--   `tools`: エージェントがタスクを達成するために使用できる tools です。  
+- `name`: エージェントを識別する必須の文字列。
+- `instructions`: developer メッセージまたは system prompt とも呼ばれます。
+- `model`: 使用する LLM、および temperature や top_p などのチューニングパラメーターを設定する `model_settings` (オプション)。
+- `tools`: エージェントがタスク達成のために使用できるツール。
 
 ```python
 from agents import Agent, ModelSettings, function_tool
 
 @function_tool
 def get_weather(city: str) -> str:
+     """returns weather info for the specified city."""
     return f"The weather in {city} is sunny"
 
 agent = Agent(
@@ -32,11 +33,12 @@ agent = Agent(
 
 ## コンテキスト
 
-エージェントは汎用的に `context` 型を取り込みます。コンテキストは dependency-injection (依存性注入) 用のオブジェクトで、あなたが作成して `Runner.run()` に渡すことで、すべてのエージェント、tool、ハンドオフなどに共有されます。実行中の依存関係や状態をまとめて保持する入れ物として機能し、任意の Python オブジェクトを渡せます。
+エージェントはその `context` 型に対して汎用的です。コンテキストは依存性注入ツールであり、あなたが作成して `Runner.run()` に渡すオブジェクトです。このオブジェクトはすべてのエージェント、ツール、ハンドオフなどに渡され、エージェント実行の依存関係や状態をまとめて保持します。コンテキストには任意の Python オブジェクトを渡せます。
 
 ```python
 @dataclass
 class UserContext:
+    name: str
     uid: str
     is_pro_user: bool
 
@@ -50,7 +52,7 @@ agent = Agent[UserContext](
 
 ## 出力タイプ
 
-デフォルトでは、エージェントはプレーンテキスト (つまり `str`) を出力します。特定の型で出力させたい場合は、`output_type` パラメーターを使用してください。よく使われる選択肢として [Pydantic](https://docs.pydantic.dev/) オブジェクトがありますが、Pydantic の [TypeAdapter](https://docs.pydantic.dev/latest/api/type_adapter/) でラップできる型であれば、dataclass、list、TypedDict など何でも対応しています。
+デフォルトでは、エージェントはプレーンテキスト (すなわち `str`) を出力します。特定の型で出力させたい場合は、`output_type` パラメーターを使用します。一般的には [Pydantic](https://docs.pydantic.dev/) オブジェクトを使いますが、Pydantic の [TypeAdapter](https://docs.pydantic.dev/latest/api/type_adapter/) でラップできる型―dataclass、list、TypedDict など―であれば利用できます。
 
 ```python
 from pydantic import BaseModel
@@ -71,11 +73,11 @@ agent = Agent(
 
 !!! note
 
-    `output_type` を渡すと、モデルは通常のプレーンテキスト応答ではなく、[structured outputs](https://platform.openai.com/docs/guides/structured-outputs) を使用するようになります。
+    `output_type` を指定すると、モデルは通常のプレーンテキスト応答ではなく [structured outputs](https://platform.openai.com/docs/guides/structured-outputs) を使用するよう指示されます。
 
 ## ハンドオフ
 
-ハンドオフは、エージェントが委任できるサブエージェントです。ハンドオフのリストを渡すと、エージェントは必要に応じてそれらに委任できます。これは、単一タスクに特化したモジュール化されたエージェントをオーケストレーションする強力なパターンです。詳しくは [ハンドオフ](handoffs.md) のドキュメントをご覧ください。
+ハンドオフは、エージェントが委譲できるサブエージェントです。ハンドオフのリストを提供すると、エージェントは関連する場合にそれらへ委譲できます。これは、単一タスクに特化したモジュール型エージェントをオーケストレーションする強力なパターンです。詳しくは [handoffs](handoffs.md) ドキュメントをご覧ください。
 
 ```python
 from agents import Agent
@@ -96,7 +98,7 @@ triage_agent = Agent(
 
 ## 動的 instructions
 
-多くの場合、エージェント作成時に instructions を渡せますが、関数を介して動的に instructions を生成することも可能です。その関数は agent と context を受け取り、プロンプトを返さなければなりません。同期関数と `async` 関数のどちらも利用できます。
+通常はエージェント作成時に instructions を渡しますが、関数を通じて動的に渡すこともできます。この関数はエージェントと context を受け取り、プロンプトを返さなければなりません。同期関数と `async` 関数の両方を使用できます。
 
 ```python
 def dynamic_instructions(
@@ -111,17 +113,17 @@ agent = Agent[UserContext](
 )
 ```
 
-## ライフサイクルイベント (hooks)
+## ライフサイクルイベント (フック)
 
-エージェントのライフサイクルを監視したい場合があります。たとえば、イベントをログに記録したり、特定のイベント発生時にデータを事前取得したりできます。`hooks` プロパティを使ってエージェントのライフサイクルにフックできます。[`AgentHooks`][agents.lifecycle.AgentHooks] クラスを継承し、関心のあるメソッドをオーバーライドしてください。
+エージェントのライフサイクルを監視したい場合があります。たとえば、イベントをログに記録したり、特定のイベント発生時にデータをプリフェッチしたりするケースです。`hooks` プロパティを使ってエージェントのライフサイクルにフックできます。[`AgentHooks`][agents.lifecycle.AgentHooks] をサブクラス化し、関心のあるメソッドをオーバーライドしてください。
 
 ## ガードレール
 
-ガードレールを利用すると、エージェントの実行と並行してユーザー入力のチェックやバリデーションを行えます。たとえば、ユーザー入力の関連性をスクリーニングできます。詳細は [ガードレール](guardrails.md) のドキュメントをご覧ください。
+ガードレールを使うと、エージェント実行と並行してユーザー入力に対するチェックやバリデーションを実行できます。たとえば、ユーザー入力の関連性をスクリーニングすることが可能です。詳細は [guardrails](guardrails.md) ドキュメントをご覧ください。
 
 ## エージェントのクローン／コピー
 
-エージェントの `clone()` メソッドを使うと、既存のエージェントを複製し、必要に応じて任意のプロパティを変更できます。
+エージェントの `clone()` メソッドを使うと、エージェントを複製し、任意のプロパティを変更できます。
 
 ```python
 pirate_agent = Agent(
@@ -138,15 +140,110 @@ robot_agent = pirate_agent.clone(
 
 ## ツール使用の強制
 
-tools のリストを渡しても、LLM が必ずしもツールを使用するとは限りません。[`ModelSettings.tool_choice`][agents.model_settings.ModelSettings.tool_choice] を設定することで、ツール使用を強制できます。有効な値は次のとおりです。
+ツールのリストを渡しても、必ずしも LLM がツールを使用するとは限りません。[`ModelSettings.tool_choice`][agents.model_settings.ModelSettings.tool_choice] を設定するとツール使用を強制できます。有効な値は次のとおりです。
 
-1. `auto`：LLM がツールを使うかどうかを判断します。  
-2. `required`：LLM にツール使用を必須とします (ただしどのツールを使うかは賢く選択します)。  
-3. `none`：LLM にツールを使用しないことを必須とします。  
-4. 具体的な文字列 (例: `my_tool`) を設定すると、LLM はそのツールを必ず使用します。  
+1. `auto` : LLM がツールを使用するかどうかを自動で判断します。
+2. `required` : LLM にツール使用を必須とします (使用するツールはインテリジェントに決定)。
+3. `none` : LLM にツールを使用しないことを要求します。
+4. 具体的な文字列 (例: `my_tool`) を設定すると、そのツールを必ず使用させます。
+
+```python
+from agents import Agent, Runner, function_tool, ModelSettings
+
+@function_tool
+def get_weather(city: str) -> str:
+    """Returns weather info for the specified city."""
+    return f"The weather in {city} is sunny"
+
+agent = Agent(
+    name="Weather Agent",
+    instructions="Retrieve weather details.",
+    tools=[get_weather],
+    model_settings=ModelSettings(tool_choice="get_weather") 
+)
+```
+
+## ツール使用の挙動
+
+`Agent` の `tool_use_behavior` パラメーターはツール出力の扱い方を制御します。
+
+- `"run_llm_again"`: デフォルト設定。ツールを実行し、その結果を LLM が処理して最終応答を生成します。
+- `"stop_on_first_tool"`: 最初に呼び出されたツールの出力をそのまま最終応答として使用し、追加の LLM 処理を行いません。
+
+```python
+from agents import Agent, Runner, function_tool, ModelSettings
+
+@function_tool
+def get_weather(city: str) -> str:
+    """Returns weather info for the specified city."""
+    return f"The weather in {city} is sunny"
+
+agent = Agent(
+    name="Weather Agent",
+    instructions="Retrieve weather details.",
+    tools=[get_weather],
+    tool_use_behavior="stop_on_first_tool"
+)
+```
+
+- `StopAtTools(stop_at_tool_names=[...])`: 指定したツールのいずれかが呼び出されると停止し、その出力を最終応答とします。  
+```python
+from agents import Agent, Runner, function_tool
+from agents.agent import StopAtTools
+
+@function_tool
+def get_weather(city: str) -> str:
+    """Returns weather info for the specified city."""
+    return f"The weather in {city} is sunny"
+
+@function_tool
+def sum_numbers(a: int, b: int) -> int:
+    """Adds two numbers."""
+    return a + b
+
+agent = Agent(
+    name="Stop At Stock Agent",
+    instructions="Get weather or sum numbers.",
+    tools=[get_weather, sum_numbers],
+    tool_use_behavior=StopAtTools(stop_at_tool_names=["get_weather"])
+)
+```
+- `ToolsToFinalOutputFunction`: ツール結果を処理し、停止するか LLM を続行するかを決定するカスタム関数。  
+
+```python
+from agents import Agent, Runner, function_tool, FunctionToolResult, RunContextWrapper
+from agents.agent import ToolsToFinalOutputResult
+from typing import List, Any
+
+@function_tool
+def get_weather(city: str) -> str:
+    """Returns weather info for the specified city."""
+    return f"The weather in {city} is sunny"
+
+def custom_tool_handler(
+    context: RunContextWrapper[Any],
+    tool_results: List[FunctionToolResult]
+) -> ToolsToFinalOutputResult:
+    """Processes tool results to decide final output."""
+    for result in tool_results:
+        if result.output and "sunny" in result.output:
+            return ToolsToFinalOutputResult(
+                is_final_output=True,
+                final_output=f"Final weather: {result.output}"
+            )
+    return ToolsToFinalOutputResult(
+        is_final_output=False,
+        final_output=None
+    )
+
+agent = Agent(
+    name="Weather Agent",
+    instructions="Retrieve weather details.",
+    tools=[get_weather],
+    tool_use_behavior=custom_tool_handler
+)
+```
 
 !!! note
 
-    無限ループを防ぐため、フレームワークはツール呼び出し後に自動で `tool_choice` を "auto" にリセットします。この挙動は [`agent.reset_tool_choice`][agents.agent.Agent.reset_tool_choice] で設定可能です。ツールの実行結果が再び LLM に送られ、`tool_choice` の設定により新たなツール呼び出しが発生し続けるのが無限ループの原因です。
-
-    ツール呼び出し後に自動モードで継続せず完全に停止したい場合は、[`Agent.tool_use_behavior="stop_on_first_tool"`] を設定してください。ツールの出力をそのまま最終応答として使用し、追加の LLM 処理を行いません。
+    無限ループを防ぐため、フレームワークはツール呼び出し後に `tool_choice` を自動的に "auto" にリセットします。この挙動は [`agent.reset_tool_choice`][agents.agent.Agent.reset_tool_choice] で設定できます。ツール結果が LLM に送られ、その後 `tool_choice` により再度ツール呼び出しが生成され…という無限ループを防止するためです。
