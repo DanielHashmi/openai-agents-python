@@ -4,7 +4,7 @@ search:
 ---
 # パイプラインとワークフロー
 
-[`VoicePipeline`][agents.voice.pipeline.VoicePipeline] は、エージェント ベースのワークフローを音声アプリへ簡単に変換できるクラスです。実行したいワークフローを渡すだけで、パイプラインが入力音声の書き起こし、音声終了の検出、適切なタイミングでのワークフロー呼び出し、そしてワークフロー出力を再び音声へ変換する処理を自動で行います。
+[`VoicePipeline`][agents.voice.pipeline.VoicePipeline] は、エージェント型ワークフローを音声アプリに変換しやすくするクラスです。実行するワークフローを渡すと、パイプラインが入力音声の文字起こし、音声の終了検知、適切なタイミングでのワークフロー呼び出し、そしてワークフロー出力を音声へ戻す処理を行います。
 
 ```mermaid
 graph LR
@@ -34,36 +34,29 @@ graph LR
 
 ## パイプラインの設定
 
-パイプラインを作成する際には、次の項目を設定できます。
+パイプラインを作成する際、次の項目を設定できます。
 
-1. [`workflow`][agents.voice.workflow.VoiceWorkflowBase]  
-   新しい音声が書き起こされるたびに実行されるコードです。  
-2. [`speech-to-text`][agents.voice.model.STTModel] と [`text-to-speech`][agents.voice.model.TTSModel] の各モデル  
-3. [`config`][agents.voice.pipeline_config.VoicePipelineConfig]  
-   次のような内容を設定できます。  
-   - モデル名をモデルにマッピングするモデルプロバイダー  
-   - トレーシングの有効／無効、音声ファイルのアップロード有無、ワークフロー名、トレース ID など  
-   - TTS・STT モデルのプロンプト、言語、データ型などの設定
+1. 毎回新しい音声が文字起こしされるたびに実行されるコードである [`workflow`][agents.voice.workflow.VoiceWorkflowBase]
+2. 使用する [`speech-to-text`][agents.voice.model.STTModel] および [`text-to-speech`][agents.voice.model.TTSModel] モデル
+3. 次のような項目を設定できる [`config`][agents.voice.pipeline_config.VoicePipelineConfig]
+    - モデルプロバイダー（モデル名をモデルにマッピング可能）
+    - トレーシング（トレーシングの無効化可否、音声ファイルのアップロード可否、ワークフロー名、トレース ID など）
+    - TTS および STT モデルの設定（プロンプト、言語、使用するデータ型など）
 
 ## パイプラインの実行
 
-パイプラインは [`run()`][agents.voice.pipeline.VoicePipeline.run] メソッドで実行できます。音声入力は 2 通りの形式で渡せます。
+パイプラインは [`run()`][agents.voice.pipeline.VoicePipeline.run] メソッドで実行でき、音声入力を次の 2 つの形式で渡せます。
 
-1. [`AudioInput`][agents.voice.input.AudioInput]  
-   完全な音声の書き起こしがある場合に使用します。話者がいつ話し終えたかを検出する必要がない、たとえば事前録音された音声やプッシュトゥトーク アプリなどに適しています。  
-2. [`StreamedAudioInput`][agents.voice.input.StreamedAudioInput]  
-   話者が話し終えたタイミングを検出する必要がある場合に使用します。検出された音声チャンクを順次プッシュでき、パイプラインが「アクティビティ検出」と呼ばれる処理を通じて適切なタイミングでエージェント ワークフローを自動実行します。
+1. [`AudioInput`][agents.voice.input.AudioInput] は、完全な音声書き起こしがあり、その結果のみを生成したい場合に使用します。話者の発話終了を検知する必要がないケース（事前録音の音声や、ユーザーの発話終了が明確なプッシュトゥトーク型のアプリなど）に便利です。
+2. [`StreamedAudioInput`][agents.voice.input.StreamedAudioInput] は、ユーザーの発話終了の検知が必要な場合に使用します。検知された音声チャンクを逐次プッシュでき、音声パイプラインは「アクティビティ検知」と呼ばれるプロセスによって適切なタイミングでエージェントのワークフローを自動実行します。
 
-## 実行結果
+## 結果
 
-音声パイプライン実行の結果は [`StreamedAudioResult`][agents.voice.result.StreamedAudioResult] オブジェクトです。これは発生するイベントをストリーミングで受け取れるオブジェクトで、いくつかの [`VoiceStreamEvent`][agents.voice.events.VoiceStreamEvent] 種類があります。
+音声パイプライン実行の結果は [`StreamedAudioResult`][agents.voice.result.StreamedAudioResult] です。これは、発生するイベントをストリーミングで受け取れるオブジェクトです。いくつかの種類の [`VoiceStreamEvent`][agents.voice.events.VoiceStreamEvent] があり、次のものを含みます。
 
-1. [`VoiceStreamEventAudio`][agents.voice.events.VoiceStreamEventAudio]  
-   音声チャンクを含むイベント  
-2. [`VoiceStreamEventLifecycle`][agents.voice.events.VoiceStreamEventLifecycle]  
-   ターン開始・終了などのライフサイクル イベントを知らせるイベント  
-3. [`VoiceStreamEventError`][agents.voice.events.VoiceStreamEventError]  
-   エラー イベント  
+1. 音声チャンクを含む [`VoiceStreamEventAudio`][agents.voice.events.VoiceStreamEventAudio]
+2. ターンの開始や終了などのライフサイクルイベントを通知する [`VoiceStreamEventLifecycle`][agents.voice.events.VoiceStreamEventLifecycle]
+3. エラーイベントである [`VoiceStreamEventError`][agents.voice.events.VoiceStreamEventError]
 
 ```python
 
@@ -81,6 +74,6 @@ async for event in result.stream():
 
 ## ベストプラクティス
 
-### 割り込み処理
+### 割り込み
 
-現在、 Agents SDK には [`StreamedAudioInput`][agents.voice.input.StreamedAudioInput] に対する組み込みの割り込み処理機能はありません。検出された各ターンごとに、別々にワークフローが実行されます。アプリ内で割り込みを扱いたい場合は、[`VoiceStreamEventLifecycle`][agents.voice.events.VoiceStreamEventLifecycle] イベントを監視してください。`turn_started` は新しいターンが書き起こされ、処理が開始されたことを示します。`turn_ended` は対応するターンの音声がすべて送信された後に発火します。モデルがターンを開始したときにマイクをミュートし、関連する音声をすべて送信し終えたらアンミュートする、といった制御をこれらのイベントで行えます。
+Agents SDK は現在、[`StreamedAudioInput`][agents.voice.input.StreamedAudioInput] に対するビルトインの割り込み機能をサポートしていません。代わりに、検知された各ターンごとにワークフローの個別実行がトリガーされます。アプリケーション内で割り込みを扱いたい場合は、[`VoiceStreamEventLifecycle`][agents.voice.events.VoiceStreamEventLifecycle] イベントを監視してください。`turn_started` は新しいターンが文字起こしされ、処理が開始されたことを示します。`turn_ended` は該当ターンのすべての音声がディスパッチされた後に発火します。これらのイベントを用いて、モデルがターンを開始したら話者のマイクをミュートし、ターンに関連する音声をすべてフラッシュした後にミュート解除する、といった制御が可能です。

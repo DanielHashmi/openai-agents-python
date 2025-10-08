@@ -10,6 +10,7 @@ from typing_extensions import assert_never
 from ..agent import Agent
 from ..exceptions import ModelBehaviorError, UserError
 from ..handoffs import Handoff
+from ..logger import logger
 from ..run_context import RunContextWrapper, TContext
 from ..tool import FunctionTool
 from ..tool_context import ToolContext
@@ -27,13 +28,23 @@ from .events import (
     RealtimeHandoffEvent,
     RealtimeHistoryAdded,
     RealtimeHistoryUpdated,
+    RealtimeInputAudioTimeoutTriggered,
     RealtimeRawModelEvent,
     RealtimeSessionEvent,
     RealtimeToolEnd,
     RealtimeToolStart,
 )
 from .handoffs import realtime_handoff
-from .items import InputAudio, InputText, RealtimeItem
+from .items import (
+    AssistantAudio,
+    AssistantMessageItem,
+    AssistantText,
+    InputAudio,
+    InputImage,
+    InputText,
+    RealtimeItem,
+    UserMessageItem,
+)
 from .model import RealtimeModel, RealtimeModelConfig, RealtimeModelListener
 from .model_events import (
     RealtimeModelEvent,
@@ -93,12 +104,18 @@ class RealtimeSession(RealtimeModelListener):
         self._history: list[RealtimeItem] = []
         self._model_config = model_config or {}
         self._run_config = run_config or {}
+        initial_model_settings = self._model_config.get("initial_model_settings")
+        run_config_settings = self._run_config.get("model_settings")
+        self._base_model_settings: RealtimeSessionModelSettings = {
+            **(run_config_settings or {}),
+            **(initial_model_settings or {}),
+        }
         self._event_queue: asyncio.Queue[RealtimeSessionEvent] = asyncio.Queue()
         self._closed = False
         self._stored_exception: Exception | None = None
 
         # Guardrails state tracking
-        self._interrupted_by_guardrail = False
+        self._interrupted_response_ids: set[str] = set()
         self._item_transcripts: dict[str, str] = {}  # item_id -> accumulated transcript
         self._item_guardrail_run_counts: dict[str, int] = {}  # item_id -> run count
         self._debounce_text_length = self._run_config.get("guardrails_settings", {}).get(
@@ -222,9 +239,22 @@ class RealtimeSession(RealtimeModelListener):
                 )
             )
         elif event.type == "input_audio_transcription_completed":
+            prev_len = len(self._history)
             self._history = RealtimeSession._get_new_history(self._history, event)
+            # If a new user item was appended (no existing item),
+            # emit history_added for incremental UIs.
+            if len(self._history) > prev_len and len(self._history) > 0:
+                new_item = self._history[-1]
+                await self._put_event(RealtimeHistoryAdded(info=self._event_info, item=new_item))
+            else:
+                await self._put_event(
+                    RealtimeHistoryUpdated(info=self._event_info, history=self._history)
+                )
+        elif event.type == "input_audio_timeout_triggered":
             await self._put_event(
-                RealtimeHistoryUpdated(info=self._event_info, history=self._history)
+                RealtimeInputAudioTimeoutTriggered(
+                    info=self._event_info,
+                )
             )
         elif event.type == "transcript_delta":
             # Accumulate transcript text for guardrail debouncing per item_id
@@ -234,6 +264,13 @@ class RealtimeSession(RealtimeModelListener):
                 self._item_guardrail_run_counts[item_id] = 0
 
             self._item_transcripts[item_id] += event.delta
+            self._history = self._get_new_history(
+                self._history,
+                AssistantMessageItem(
+                    item_id=item_id,
+                    content=[AssistantAudio(transcript=self._item_transcripts[item_id])],
+                ),
+            )
 
             # Check if we should run guardrails based on debounce threshold
             current_length = len(self._item_transcripts[item_id])
@@ -242,10 +279,62 @@ class RealtimeSession(RealtimeModelListener):
 
             if current_length >= next_run_threshold:
                 self._item_guardrail_run_counts[item_id] += 1
-                self._enqueue_guardrail_task(self._item_transcripts[item_id])
+                # Pass response_id so we can ensure only a single interrupt per response
+                self._enqueue_guardrail_task(self._item_transcripts[item_id], event.response_id)
         elif event.type == "item_updated":
             is_new = not any(item.item_id == event.item.item_id for item in self._history)
-            self._history = self._get_new_history(self._history, event.item)
+
+            # Preserve previously known transcripts when updating existing items.
+            # This prevents transcripts from disappearing when an item is later
+            # retrieved without transcript fields populated.
+            incoming_item = event.item
+            existing_item = next(
+                (i for i in self._history if i.item_id == incoming_item.item_id), None
+            )
+
+            if (
+                existing_item is not None
+                and existing_item.type == "message"
+                and incoming_item.type == "message"
+            ):
+                try:
+                    # Merge transcripts for matching content indices
+                    existing_content = existing_item.content
+                    new_content = []
+                    for idx, entry in enumerate(incoming_item.content):
+                        # Only attempt to preserve for audio-like content
+                        if entry.type in ("audio", "input_audio"):
+                            # Use tuple form for Python 3.9 compatibility
+                            assert isinstance(entry, (InputAudio, AssistantAudio))
+                            # Determine if transcript is missing/empty on the incoming entry
+                            entry_transcript = entry.transcript
+                            if not entry_transcript:
+                                preserved: str | None = None
+                                # First prefer any transcript from the existing history item
+                                if idx < len(existing_content):
+                                    this_content = existing_content[idx]
+                                    if isinstance(this_content, AssistantAudio) or isinstance(
+                                        this_content, InputAudio
+                                    ):
+                                        preserved = this_content.transcript
+
+                                # If still missing and this is an assistant item, fall back to
+                                # accumulated transcript deltas tracked during the turn.
+                                if incoming_item.role == "assistant":
+                                    preserved = self._item_transcripts.get(incoming_item.item_id)
+
+                                if preserved:
+                                    entry = entry.model_copy(update={"transcript": preserved})
+
+                        new_content.append(entry)
+
+                    if new_content:
+                        incoming_item = incoming_item.model_copy(update={"content": new_content})
+                except Exception:
+                    logger.error("Error merging transcripts", exc_info=True)
+                    pass
+
+            self._history = self._get_new_history(self._history, incoming_item)
             if is_new:
                 new_item = next(
                     item for item in self._history if item.item_id == event.item.item_id
@@ -274,7 +363,6 @@ class RealtimeSession(RealtimeModelListener):
             # Clear guardrail state for next turn
             self._item_transcripts.clear()
             self._item_guardrail_run_counts.clear()
-            self._interrupted_by_guardrail = False
 
             await self._put_event(
                 RealtimeAgentEndEvent(
@@ -320,6 +408,7 @@ class RealtimeSession(RealtimeModelListener):
                 usage=self._context_wrapper.usage,
                 tool_name=event.name,
                 tool_call_id=event.call_id,
+                tool_arguments=event.arguments,
             )
             result = await func_tool.on_invoke_tool(tool_context, event.arguments)
 
@@ -344,6 +433,7 @@ class RealtimeSession(RealtimeModelListener):
                 usage=self._context_wrapper.usage,
                 tool_name=event.name,
                 tool_call_id=event.call_id,
+                tool_arguments=event.arguments,
             )
 
             # Execute the handoff to get the new agent
@@ -397,9 +487,9 @@ class RealtimeSession(RealtimeModelListener):
         old_history: list[RealtimeItem],
         event: RealtimeModelInputAudioTranscriptionCompletedEvent | RealtimeItem,
     ) -> list[RealtimeItem]:
-        # Merge transcript into placeholder input_audio message.
         if isinstance(event, RealtimeModelInputAudioTranscriptionCompletedEvent):
             new_history: list[RealtimeItem] = []
+            existing_item_found = False
             for item in old_history:
                 if item.item_id == event.item_id and item.type == "message" and item.role == "user":
                     content: list[InputText | InputAudio] = []
@@ -412,11 +502,18 @@ class RealtimeSession(RealtimeModelListener):
                     new_history.append(
                         item.model_copy(update={"content": content, "status": "completed"})
                     )
+                    existing_item_found = True
                 else:
                     new_history.append(item)
+
+            if existing_item_found is False:
+                new_history.append(
+                    UserMessageItem(
+                        item_id=event.item_id, content=[InputText(text=event.transcript)]
+                    )
+                )
             return new_history
 
-        # Otherwise it's just a new item
         # TODO (rm) Add support for audio storage config
 
         # If the item already exists, update it
@@ -425,8 +522,122 @@ class RealtimeSession(RealtimeModelListener):
         )
         if existing_index is not None:
             new_history = old_history.copy()
-            new_history[existing_index] = event
+            if event.type == "message" and event.content is not None and len(event.content) > 0:
+                existing_item = old_history[existing_index]
+                if existing_item.type == "message":
+                    # Merge content preserving existing transcript/text when incoming entry is empty
+                    if event.role == "assistant" and existing_item.role == "assistant":
+                        assistant_existing_content = existing_item.content
+                        assistant_incoming = event.content
+                        assistant_new_content: list[AssistantText | AssistantAudio] = []
+                        for idx, ac in enumerate(assistant_incoming):
+                            if idx >= len(assistant_existing_content):
+                                assistant_new_content.append(ac)
+                                continue
+                            assistant_current = assistant_existing_content[idx]
+                            if ac.type == "audio":
+                                if ac.transcript is None:
+                                    assistant_new_content.append(assistant_current)
+                                else:
+                                    assistant_new_content.append(ac)
+                            else:  # text
+                                cur_text = (
+                                    assistant_current.text
+                                    if isinstance(assistant_current, AssistantText)
+                                    else None
+                                )
+                                if cur_text is not None and ac.text is None:
+                                    assistant_new_content.append(assistant_current)
+                                else:
+                                    assistant_new_content.append(ac)
+                        updated_assistant = event.model_copy(
+                            update={"content": assistant_new_content}
+                        )
+                        new_history[existing_index] = updated_assistant
+                    elif event.role == "user" and existing_item.role == "user":
+                        user_existing_content = existing_item.content
+                        user_incoming = event.content
+
+                        # Start from incoming content (prefer latest fields)
+                        user_new_content: list[InputText | InputAudio | InputImage] = list(
+                            user_incoming
+                        )
+
+                        # Merge by type with special handling for images and transcripts
+                        def _image_url_str(val: object) -> str | None:
+                            if isinstance(val, InputImage):
+                                return val.image_url or None
+                            return None
+
+                        # 1) Preserve any existing images that are missing from the incoming payload
+                        incoming_image_urls: set[str] = set()
+                        for part in user_incoming:
+                            if isinstance(part, InputImage):
+                                u = _image_url_str(part)
+                                if u:
+                                    incoming_image_urls.add(u)
+
+                        missing_images: list[InputImage] = []
+                        for part in user_existing_content:
+                            if isinstance(part, InputImage):
+                                u = _image_url_str(part)
+                                if u and u not in incoming_image_urls:
+                                    missing_images.append(part)
+
+                        # Insert missing images at the beginning to keep them visible and stable
+                        if missing_images:
+                            user_new_content = missing_images + user_new_content
+
+                        # 2) For text/audio entries, preserve existing when incoming entry is empty
+                        merged: list[InputText | InputAudio | InputImage] = []
+                        for idx, uc in enumerate(user_new_content):
+                            if uc.type == "input_audio":
+                                # Attempt to preserve transcript if empty
+                                transcript = getattr(uc, "transcript", None)
+                                if transcript is None and idx < len(user_existing_content):
+                                    prev = user_existing_content[idx]
+                                    if isinstance(prev, InputAudio) and prev.transcript is not None:
+                                        uc = uc.model_copy(update={"transcript": prev.transcript})
+                                merged.append(uc)
+                            elif uc.type == "input_text":
+                                text = getattr(uc, "text", None)
+                                if (text is None or text == "") and idx < len(
+                                    user_existing_content
+                                ):
+                                    prev = user_existing_content[idx]
+                                    if isinstance(prev, InputText) and prev.text:
+                                        uc = uc.model_copy(update={"text": prev.text})
+                                merged.append(uc)
+                            else:
+                                merged.append(uc)
+
+                        updated_user = event.model_copy(update={"content": merged})
+                        new_history[existing_index] = updated_user
+                    elif event.role == "system" and existing_item.role == "system":
+                        system_existing_content = existing_item.content
+                        system_incoming = event.content
+                        # Prefer existing non-empty text when incoming is empty
+                        system_new_content: list[InputText] = []
+                        for idx, sc in enumerate(system_incoming):
+                            if idx >= len(system_existing_content):
+                                system_new_content.append(sc)
+                                continue
+                            system_current = system_existing_content[idx]
+                            cur_text = system_current.text
+                            if cur_text is not None and sc.text is None:
+                                system_new_content.append(system_current)
+                            else:
+                                system_new_content.append(sc)
+                        updated_system = event.model_copy(update={"content": system_new_content})
+                        new_history[existing_index] = updated_system
+                    else:
+                        # Role changed or mismatched; just replace
+                        new_history[existing_index] = event
+                else:
+                    # If the existing item is not a message, just replace it.
+                    new_history[existing_index] = event
             return new_history
+
         # Otherwise, insert it after the previous_item_id if that is set
         elif event.previous_item_id:
             # Insert the new item after the previous item
@@ -442,7 +653,7 @@ class RealtimeSession(RealtimeModelListener):
         # Otherwise, add it to the end
         return old_history + [event]
 
-    async def _run_output_guardrails(self, text: str) -> bool:
+    async def _run_output_guardrails(self, text: str, response_id: str) -> bool:
         """Run output guardrails on the given text. Returns True if any guardrail was triggered."""
         combined_guardrails = self._current_agent.output_guardrails + self._run_config.get(
             "output_guardrails", []
@@ -455,7 +666,8 @@ class RealtimeSession(RealtimeModelListener):
                 output_guardrails.append(guardrail)
                 seen_ids.add(guardrail_id)
 
-        if not output_guardrails or self._interrupted_by_guardrail:
+        # If we've already interrupted this response, skip
+        if not output_guardrails or response_id in self._interrupted_response_ids:
             return False
 
         triggered_results = []
@@ -475,8 +687,12 @@ class RealtimeSession(RealtimeModelListener):
                 continue
 
         if triggered_results:
-            # Mark as interrupted to prevent multiple interrupts
-            self._interrupted_by_guardrail = True
+            # Double-check: bail if already interrupted for this response
+            if response_id in self._interrupted_response_ids:
+                return False
+
+            # Mark as interrupted immediately (before any awaits) to minimize race window
+            self._interrupted_response_ids.add(response_id)
 
             # Emit guardrail tripped event
             await self._put_event(
@@ -502,10 +718,10 @@ class RealtimeSession(RealtimeModelListener):
 
         return False
 
-    def _enqueue_guardrail_task(self, text: str) -> None:
+    def _enqueue_guardrail_task(self, text: str, response_id: str) -> None:
         # Runs the guardrails in a separate task to avoid blocking the main loop
 
-        task = asyncio.create_task(self._run_output_guardrails(text))
+        task = asyncio.create_task(self._run_output_guardrails(text, response_id))
         self._guardrail_tasks.add(task)
 
         # Add callback to remove completed tasks and handle exceptions
@@ -555,12 +771,11 @@ class RealtimeSession(RealtimeModelListener):
         starting_settings: RealtimeSessionModelSettings | None,
         agent: RealtimeAgent,
     ) -> RealtimeSessionModelSettings:
-        # Start with run config model settings as base
-        run_config_settings = self._run_config.get("model_settings", {})
-        updated_settings: RealtimeSessionModelSettings = run_config_settings.copy()
-        # Apply starting settings (from model config) next
-        if starting_settings:
-            updated_settings.update(starting_settings)
+        # Start with the merged base settings from run and model configuration.
+        updated_settings = self._base_model_settings.copy()
+
+        if agent.prompt is not None:
+            updated_settings["prompt"] = agent.prompt
 
         instructions, tools, handoffs = await asyncio.gather(
             agent.get_system_prompt(self._context_wrapper),
@@ -570,6 +785,10 @@ class RealtimeSession(RealtimeModelListener):
         updated_settings["instructions"] = instructions or ""
         updated_settings["tools"] = tools or []
         updated_settings["handoffs"] = handoffs or []
+
+        # Apply starting settings (from model config) next
+        if starting_settings:
+            updated_settings.update(starting_settings)
 
         disable_tracing = self._run_config.get("tracing_disabled", False)
         if disable_tracing:

@@ -3,10 +3,11 @@ from __future__ import annotations
 import abc
 import asyncio
 import inspect
+from collections.abc import Awaitable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, TypeVar
 
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp import ClientSession, StdioServerParameters, Tool as MCPTool, stdio_client
@@ -19,7 +20,9 @@ from typing_extensions import NotRequired, TypedDict
 from ..exceptions import UserError
 from ..logger import logger
 from ..run_context import RunContextWrapper
-from .util import ToolFilter, ToolFilterCallable, ToolFilterContext, ToolFilterStatic
+from .util import HttpClientFactory, ToolFilter, ToolFilterContext, ToolFilterStatic
+
+T = TypeVar("T")
 
 if TYPE_CHECKING:
     from ..agent import AgentBase
@@ -98,6 +101,8 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         client_session_timeout_seconds: float | None,
         tool_filter: ToolFilter = None,
         use_structured_content: bool = False,
+        max_retry_attempts: int = 0,
+        retry_backoff_seconds_base: float = 1.0,
     ):
         """
         Args:
@@ -115,6 +120,10 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
                 include the structured content in the `tool_result.content`, and using it by
                 default will cause duplicate content. You can set this to True if you know the
                 server will not duplicate the structured content in the `tool_result.content`.
+            max_retry_attempts: Number of times to retry failed list_tools/call_tool calls.
+                Defaults to no retries.
+            retry_backoff_seconds_base: The base delay, in seconds, used for exponential
+                backoff between retries.
         """
         super().__init__(use_structured_content=use_structured_content)
         self.session: ClientSession | None = None
@@ -124,6 +133,8 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         self.server_initialize_result: InitializeResult | None = None
 
         self.client_session_timeout_seconds = client_session_timeout_seconds
+        self.max_retry_attempts = max_retry_attempts
+        self.retry_backoff_seconds_base = retry_backoff_seconds_base
 
         # The cache is always dirty at startup, so that we fetch tools at least once
         self._cache_dirty = True
@@ -175,10 +186,10 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
     ) -> list[MCPTool]:
         """Apply dynamic tool filtering using a callable filter function."""
 
-        # Ensure we have a callable filter and cast to help mypy
+        # Ensure we have a callable filter
         if not callable(self.tool_filter):
             raise ValueError("Tool filter must be callable for dynamic filtering")
-        tool_filter_func = cast(ToolFilterCallable, self.tool_filter)
+        tool_filter_func = self.tool_filter
 
         # Create filter context
         filter_context = ToolFilterContext(
@@ -233,6 +244,18 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         """Invalidate the tools cache."""
         self._cache_dirty = True
 
+    async def _run_with_retries(self, func: Callable[[], Awaitable[T]]) -> T:
+        attempts = 0
+        while True:
+            try:
+                return await func()
+            except Exception:
+                attempts += 1
+                if self.max_retry_attempts != -1 and attempts > self.max_retry_attempts:
+                    raise
+                backoff = self.retry_backoff_seconds_base * (2 ** (attempts - 1))
+                await asyncio.sleep(backoff)
+
     async def connect(self):
         """Connect to the server."""
         try:
@@ -267,15 +290,17 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         """List the tools available on the server."""
         if not self.session:
             raise UserError("Server not initialized. Make sure you call `connect()` first.")
+        session = self.session
+        assert session is not None
 
         # Return from cache if caching is enabled, we have tools, and the cache is not dirty
         if self.cache_tools_list and not self._cache_dirty and self._tools_list:
             tools = self._tools_list
         else:
-            # Reset the cache dirty to False
-            self._cache_dirty = False
             # Fetch the tools from the server
-            self._tools_list = (await self.session.list_tools()).tools
+            result = await self._run_with_retries(lambda: session.list_tools())
+            self._tools_list = result.tools
+            self._cache_dirty = False
             tools = self._tools_list
 
         # Filter tools based on tool_filter
@@ -290,8 +315,10 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         """Invoke a tool on the server."""
         if not self.session:
             raise UserError("Server not initialized. Make sure you call `connect()` first.")
+        session = self.session
+        assert session is not None
 
-        return await self.session.call_tool(tool_name, arguments)
+        return await self._run_with_retries(lambda: session.call_tool(tool_name, arguments))
 
     async def list_prompts(
         self,
@@ -365,6 +392,8 @@ class MCPServerStdio(_MCPServerWithClientSession):
         client_session_timeout_seconds: float | None = 5,
         tool_filter: ToolFilter = None,
         use_structured_content: bool = False,
+        max_retry_attempts: int = 0,
+        retry_backoff_seconds_base: float = 1.0,
     ):
         """Create a new MCP server based on the stdio transport.
 
@@ -388,12 +417,18 @@ class MCPServerStdio(_MCPServerWithClientSession):
                 include the structured content in the `tool_result.content`, and using it by
                 default will cause duplicate content. You can set this to True if you know the
                 server will not duplicate the structured content in the `tool_result.content`.
+            max_retry_attempts: Number of times to retry failed list_tools/call_tool calls.
+                Defaults to no retries.
+            retry_backoff_seconds_base: The base delay, in seconds, for exponential
+                backoff between retries.
         """
         super().__init__(
             cache_tools_list,
             client_session_timeout_seconds,
             tool_filter,
             use_structured_content,
+            max_retry_attempts,
+            retry_backoff_seconds_base,
         )
 
         self.params = StdioServerParameters(
@@ -455,6 +490,8 @@ class MCPServerSse(_MCPServerWithClientSession):
         client_session_timeout_seconds: float | None = 5,
         tool_filter: ToolFilter = None,
         use_structured_content: bool = False,
+        max_retry_attempts: int = 0,
+        retry_backoff_seconds_base: float = 1.0,
     ):
         """Create a new MCP server based on the HTTP with SSE transport.
 
@@ -480,12 +517,18 @@ class MCPServerSse(_MCPServerWithClientSession):
                 include the structured content in the `tool_result.content`, and using it by
                 default will cause duplicate content. You can set this to True if you know the
                 server will not duplicate the structured content in the `tool_result.content`.
+            max_retry_attempts: Number of times to retry failed list_tools/call_tool calls.
+                Defaults to no retries.
+            retry_backoff_seconds_base: The base delay, in seconds, for exponential
+                backoff between retries.
         """
         super().__init__(
             cache_tools_list,
             client_session_timeout_seconds,
             tool_filter,
             use_structured_content,
+            max_retry_attempts,
+            retry_backoff_seconds_base,
         )
 
         self.params = params
@@ -532,6 +575,9 @@ class MCPServerStreamableHttpParams(TypedDict):
     terminate_on_close: NotRequired[bool]
     """Terminate on close"""
 
+    httpx_client_factory: NotRequired[HttpClientFactory]
+    """Custom HTTP client factory for configuring httpx.AsyncClient behavior."""
+
 
 class MCPServerStreamableHttp(_MCPServerWithClientSession):
     """MCP server implementation that uses the Streamable HTTP transport. See the [spec]
@@ -547,14 +593,16 @@ class MCPServerStreamableHttp(_MCPServerWithClientSession):
         client_session_timeout_seconds: float | None = 5,
         tool_filter: ToolFilter = None,
         use_structured_content: bool = False,
+        max_retry_attempts: int = 0,
+        retry_backoff_seconds_base: float = 1.0,
     ):
         """Create a new MCP server based on the Streamable HTTP transport.
 
         Args:
             params: The params that configure the server. This includes the URL of the server,
-                the headers to send to the server, the timeout for the HTTP request, and the
-                timeout for the Streamable HTTP connection and whether we need to
-                terminate on close.
+                the headers to send to the server, the timeout for the HTTP request, the
+                timeout for the Streamable HTTP connection, whether we need to
+                terminate on close, and an optional custom HTTP client factory.
 
             cache_tools_list: Whether to cache the tools list. If `True`, the tools list will be
                 cached and only fetched from the server once. If `False`, the tools list will be
@@ -573,12 +621,18 @@ class MCPServerStreamableHttp(_MCPServerWithClientSession):
                 include the structured content in the `tool_result.content`, and using it by
                 default will cause duplicate content. You can set this to True if you know the
                 server will not duplicate the structured content in the `tool_result.content`.
+            max_retry_attempts: Number of times to retry failed list_tools/call_tool calls.
+                Defaults to no retries.
+            retry_backoff_seconds_base: The base delay, in seconds, for exponential
+                backoff between retries.
         """
         super().__init__(
             cache_tools_list,
             client_session_timeout_seconds,
             tool_filter,
             use_structured_content,
+            max_retry_attempts,
+            retry_backoff_seconds_base,
         )
 
         self.params = params
@@ -594,13 +648,24 @@ class MCPServerStreamableHttp(_MCPServerWithClientSession):
         ]
     ]:
         """Create the streams for the server."""
-        return streamablehttp_client(
-            url=self.params["url"],
-            headers=self.params.get("headers", None),
-            timeout=self.params.get("timeout", 5),
-            sse_read_timeout=self.params.get("sse_read_timeout", 60 * 5),
-            terminate_on_close=self.params.get("terminate_on_close", True),
-        )
+        # Only pass httpx_client_factory if it's provided
+        if "httpx_client_factory" in self.params:
+            return streamablehttp_client(
+                url=self.params["url"],
+                headers=self.params.get("headers", None),
+                timeout=self.params.get("timeout", 5),
+                sse_read_timeout=self.params.get("sse_read_timeout", 60 * 5),
+                terminate_on_close=self.params.get("terminate_on_close", True),
+                httpx_client_factory=self.params["httpx_client_factory"],
+            )
+        else:
+            return streamablehttp_client(
+                url=self.params["url"],
+                headers=self.params.get("headers", None),
+                timeout=self.params.get("timeout", 5),
+                sse_read_timeout=self.params.get("sse_read_timeout", 60 * 5),
+                terminate_on_close=self.params.get("terminate_on_close", True),
+            )
 
     @property
     def name(self) -> str:

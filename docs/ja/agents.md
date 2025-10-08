@@ -4,36 +4,36 @@ search:
 ---
 # エージェント
 
-エージェントはアプリの中核となるビルディングブロックです。エージェントとは、指示とツールで構成された大規模言語モデル ( LLM ) です。
+エージェントはアプリの中核となる構成要素です。エージェントは、 instructions とツールで構成された大規模言語モデル（ LLM ）です。
 
 ## 基本設定
 
-エージェントで最もよく設定するプロパティは次のとおりです。
+エージェントで最も一般的に設定するプロパティは次のとおりです。
 
-- `name`: エージェントを識別する必須の文字列。
-- `instructions`: developer メッセージまたは system prompt とも呼ばれます。
-- `model`: 使用する LLM、および temperature や top_p などのチューニングパラメーターを設定する `model_settings` (オプション)。
-- `tools`: エージェントがタスク達成のために使用できるツール。
+-   `name`: エージェントを識別する必須の文字列です。
+-   `instructions`: developer message または system prompt とも呼ばれます。
+-   `model`: どの LLM を使うか、また `model_settings` で temperature、top_p などのモデル調整パラメーターを設定できます。
+-   `tools`: エージェントがタスクを達成するために使用できるツールです。
 
 ```python
 from agents import Agent, ModelSettings, function_tool
 
 @function_tool
 def get_weather(city: str) -> str:
-     """returns weather info for the specified city."""
+    """returns weather info for the specified city."""
     return f"The weather in {city} is sunny"
 
 agent = Agent(
     name="Haiku agent",
     instructions="Always respond in haiku form",
-    model="o3-mini",
+    model="gpt-5-nano",
     tools=[get_weather],
 )
 ```
 
 ## コンテキスト
 
-エージェントはその `context` 型に対して汎用的です。コンテキストは依存性注入ツールであり、あなたが作成して `Runner.run()` に渡すオブジェクトです。このオブジェクトはすべてのエージェント、ツール、ハンドオフなどに渡され、エージェント実行の依存関係や状態をまとめて保持します。コンテキストには任意の Python オブジェクトを渡せます。
+エージェントは `context` 型に対してジェネリックです。コンテキストは依存性注入のためのツールで、あなたが作成して `Runner.run()` に渡すオブジェクトです。これはすべてのエージェント、ツール、ハンドオフなどに渡され、エージェント実行のための依存関係と状態をまとめて持つ入れ物として機能します。任意の Python オブジェクトをコンテキストとして提供できます。
 
 ```python
 @dataclass
@@ -52,7 +52,7 @@ agent = Agent[UserContext](
 
 ## 出力タイプ
 
-デフォルトでは、エージェントはプレーンテキスト (すなわち `str`) を出力します。特定の型で出力させたい場合は、`output_type` パラメーターを使用します。一般的には [Pydantic](https://docs.pydantic.dev/) オブジェクトを使いますが、Pydantic の [TypeAdapter](https://docs.pydantic.dev/latest/api/type_adapter/) でラップできる型―dataclass、list、TypedDict など―であれば利用できます。
+デフォルトでは、エージェントはプレーンテキスト（つまり `str`）の出力を生成します。特定のタイプの出力を生成したい場合は、`output_type` パラメーターを使用できます。一般的な選択は [Pydantic](https://docs.pydantic.dev/) オブジェクトを使うことですが、Pydantic の [TypeAdapter](https://docs.pydantic.dev/latest/api/type_adapter/) でラップできる任意の型（dataclasses、lists、TypedDict など）をサポートします。
 
 ```python
 from pydantic import BaseModel
@@ -73,11 +73,49 @@ agent = Agent(
 
 !!! note
 
-    `output_type` を指定すると、モデルは通常のプレーンテキスト応答ではなく [structured outputs](https://platform.openai.com/docs/guides/structured-outputs) を使用するよう指示されます。
+    `output_type` を渡すと、モデルは通常のプレーンテキスト応答ではなく [structured outputs](https://platform.openai.com/docs/guides/structured-outputs) を使用するようになります。
 
-## ハンドオフ
+## マルチエージェント システムの設計パターン
 
-ハンドオフは、エージェントが委譲できるサブエージェントです。ハンドオフのリストを提供すると、エージェントは関連する場合にそれらへ委譲できます。これは、単一タスクに特化したモジュール型エージェントをオーケストレーションする強力なパターンです。詳しくは [handoffs](handoffs.md) ドキュメントをご覧ください。
+マルチエージェント システムの設計方法は多数ありますが、汎用的に適用できるパターンとしてよく見られるのは次の 2 つです。
+
+1. マネージャー（ツールとしてのエージェント）: 中央のマネージャー/オーケストレーターが、ツールとして公開された特化サブエージェントを呼び出し、会話の制御を保持します。
+2. ハンドオフ: ピアのエージェントが制御を特化エージェントに引き渡し、そのエージェントが会話を引き継ぎます。これは分散型です。
+
+詳細は [エージェント構築の実践ガイド](https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf) を参照してください。
+
+### マネージャー（ツールとしてのエージェント）
+
+`customer_facing_agent` はすべての ユーザー 対応を処理し、ツールとして公開された特化サブエージェントを呼び出します。詳しくは [tools](tools.md#agents-as-tools) のドキュメントを参照してください。
+
+```python
+from agents import Agent
+
+booking_agent = Agent(...)
+refund_agent = Agent(...)
+
+customer_facing_agent = Agent(
+    name="Customer-facing agent",
+    instructions=(
+        "Handle all direct user communication. "
+        "Call the relevant tools when specialized expertise is needed."
+    ),
+    tools=[
+        booking_agent.as_tool(
+            tool_name="booking_expert",
+            tool_description="Handles booking questions and requests.",
+        ),
+        refund_agent.as_tool(
+            tool_name="refund_expert",
+            tool_description="Handles refund questions and requests.",
+        )
+    ],
+)
+```
+
+### ハンドオフ
+
+ハンドオフは、エージェントが委任できるサブエージェントです。ハンドオフが発生すると、委任先のエージェントは会話履歴を受け取り、会話を引き継ぎます。このパターンにより、単一のタスクに優れたモジュール型の特化エージェントが可能になります。詳しくは [handoffs](handoffs.md) のドキュメントを参照してください。
 
 ```python
 from agents import Agent
@@ -88,9 +126,9 @@ refund_agent = Agent(...)
 triage_agent = Agent(
     name="Triage agent",
     instructions=(
-        "Help the user with their questions."
-        "If they ask about booking, handoff to the booking agent."
-        "If they ask about refunds, handoff to the refund agent."
+        "Help the user with their questions. "
+        "If they ask about booking, hand off to the booking agent. "
+        "If they ask about refunds, hand off to the refund agent."
     ),
     handoffs=[booking_agent, refund_agent],
 )
@@ -98,7 +136,7 @@ triage_agent = Agent(
 
 ## 動的 instructions
 
-通常はエージェント作成時に instructions を渡しますが、関数を通じて動的に渡すこともできます。この関数はエージェントと context を受け取り、プロンプトを返さなければなりません。同期関数と `async` 関数の両方を使用できます。
+多くの場合、エージェントの作成時に instructions を指定できますが、関数を介して動的な instructions を提供することもできます。関数はエージェントとコンテキストを受け取り、プロンプトを返す必要があります。通常の関数と `async` 関数の両方が使用できます。
 
 ```python
 def dynamic_instructions(
@@ -113,23 +151,23 @@ agent = Agent[UserContext](
 )
 ```
 
-## ライフサイクルイベント (フック)
+## ライフサイクルイベント（フック）
 
-エージェントのライフサイクルを監視したい場合があります。たとえば、イベントをログに記録したり、特定のイベント発生時にデータをプリフェッチしたりするケースです。`hooks` プロパティを使ってエージェントのライフサイクルにフックできます。[`AgentHooks`][agents.lifecycle.AgentHooks] をサブクラス化し、関心のあるメソッドをオーバーライドしてください。
+ときには、エージェントのライフサイクルを観測したい場合があります。たとえば、イベントをログに記録したり、特定のイベント発生時にデータを事前取得したりすることです。`hooks` プロパティでエージェントのライフサイクルにフックできます。[`AgentHooks`][agents.lifecycle.AgentHooks] クラスをサブクラス化し、関心のあるメソッドをオーバーライドしてください。
 
 ## ガードレール
 
-ガードレールを使うと、エージェント実行と並行してユーザー入力に対するチェックやバリデーションを実行できます。たとえば、ユーザー入力の関連性をスクリーニングすることが可能です。詳細は [guardrails](guardrails.md) ドキュメントをご覧ください。
+ガードレールにより、エージェントの実行と並行して ユーザー 入力に対するチェック/検証を実行し、エージェントの出力が生成された後にもチェック/検証を実行できます。たとえば、 ユーザー の入力とエージェントの出力を関連性でスクリーニングできます。詳しくは [guardrails](guardrails.md) のドキュメントを参照してください。
 
-## エージェントのクローン／コピー
+## エージェントの複製/コピー
 
-エージェントの `clone()` メソッドを使うと、エージェントを複製し、任意のプロパティを変更できます。
+エージェントで `clone()` メソッドを使用すると、エージェントを複製し、必要に応じて任意のプロパティを変更できます。
 
 ```python
 pirate_agent = Agent(
     name="Pirate",
     instructions="Write like a pirate",
-    model="o3-mini",
+    model="gpt-4.1",
 )
 
 robot_agent = pirate_agent.clone(
@@ -140,12 +178,12 @@ robot_agent = pirate_agent.clone(
 
 ## ツール使用の強制
 
-ツールのリストを渡しても、必ずしも LLM がツールを使用するとは限りません。[`ModelSettings.tool_choice`][agents.model_settings.ModelSettings.tool_choice] を設定するとツール使用を強制できます。有効な値は次のとおりです。
+ツールのリストを指定しても、必ずしも LLM がツールを使用するとは限りません。[`ModelSettings.tool_choice`][agents.model_settings.ModelSettings.tool_choice] を設定することでツール使用を強制できます。有効な値は次のとおりです。
 
-1. `auto` : LLM がツールを使用するかどうかを自動で判断します。
-2. `required` : LLM にツール使用を必須とします (使用するツールはインテリジェントに決定)。
-3. `none` : LLM にツールを使用しないことを要求します。
-4. 具体的な文字列 (例: `my_tool`) を設定すると、そのツールを必ず使用させます。
+1. `auto`: LLM がツールを使用するかどうかを判断します。
+2. `required`: LLM にツールの使用を必須にします（ただしどのツールを使うかは賢く判断できます）。
+3. `none`: LLM にツールを使用しない（_not_）ことを必須にします。
+4. 具体的な文字列（例: `my_tool`）を設定し、その特定のツールの使用を LLM に必須にします。
 
 ```python
 from agents import Agent, Runner, function_tool, ModelSettings
@@ -159,16 +197,16 @@ agent = Agent(
     name="Weather Agent",
     instructions="Retrieve weather details.",
     tools=[get_weather],
-    model_settings=ModelSettings(tool_choice="get_weather") 
+    model_settings=ModelSettings(tool_choice="get_weather")
 )
 ```
 
-## ツール使用の挙動
+## ツール使用の動作
 
-`Agent` の `tool_use_behavior` パラメーターはツール出力の扱い方を制御します。
+`Agent` の `tool_use_behavior` パラメーターは、ツール出力の扱いを制御します。
 
-- `"run_llm_again"`: デフォルト設定。ツールを実行し、その結果を LLM が処理して最終応答を生成します。
-- `"stop_on_first_tool"`: 最初に呼び出されたツールの出力をそのまま最終応答として使用し、追加の LLM 処理を行いません。
+- `"run_llm_again"`: デフォルト。ツールを実行し、その結果を LLM が処理して最終応答を生成します。
+- `"stop_on_first_tool"`: 最初のツール呼び出しの出力を最終応答として使用し、以降の LLM 処理は行いません。
 
 ```python
 from agents import Agent, Runner, function_tool, ModelSettings
@@ -186,7 +224,8 @@ agent = Agent(
 )
 ```
 
-- `StopAtTools(stop_at_tool_names=[...])`: 指定したツールのいずれかが呼び出されると停止し、その出力を最終応答とします。  
+- `StopAtTools(stop_at_tool_names=[...])`: 指定したツールのいずれかが呼び出された場合に停止し、その出力を最終応答として使用します。
+
 ```python
 from agents import Agent, Runner, function_tool
 from agents.agent import StopAtTools
@@ -208,7 +247,8 @@ agent = Agent(
     tool_use_behavior=StopAtTools(stop_at_tool_names=["get_weather"])
 )
 ```
-- `ToolsToFinalOutputFunction`: ツール結果を処理し、停止するか LLM を続行するかを決定するカスタム関数。  
+
+- `ToolsToFinalOutputFunction`: ツール結果を処理し、停止するか LLM を継続するかを判断するカスタム関数です。
 
 ```python
 from agents import Agent, Runner, function_tool, FunctionToolResult, RunContextWrapper
@@ -246,4 +286,4 @@ agent = Agent(
 
 !!! note
 
-    無限ループを防ぐため、フレームワークはツール呼び出し後に `tool_choice` を自動的に "auto" にリセットします。この挙動は [`agent.reset_tool_choice`][agents.agent.Agent.reset_tool_choice] で設定できます。ツール結果が LLM に送られ、その後 `tool_choice` により再度ツール呼び出しが生成され…という無限ループを防止するためです。
+    無限ループを防ぐため、フレームワークはツール呼び出し後に自動的に `tool_choice` を "auto" にリセットします。この動作は [`agent.reset_tool_choice`][agents.agent.Agent.reset_tool_choice] で設定できます。無限ループは、ツール結果が LLM に送られ、`tool_choice` により LLM が再びツール呼び出しを生成し続けることで発生します。
